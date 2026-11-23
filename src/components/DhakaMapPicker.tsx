@@ -1,0 +1,917 @@
+import React, { useEffect, useRef, useState } from 'react';
+import {
+  AdvancedMarker,
+  APIProvider,
+  APILoadingStatus,
+  Map as GoogleMap,
+  useApiLoadingStatus,
+  useMap,
+  useMapsLibrary,
+} from '@vis.gl/react-google-maps';
+import { Bike, LocateFixed, MapPin } from 'lucide-react';
+import { apiFetch } from '../lib/api';
+import { BANGLADESH_AREAS, DHAKA_AREAS } from '../lib/i18n';
+import {
+  haversineDistanceKm,
+  matchCanonicalAreaFromHints,
+  resolveNearestAreaFromList,
+} from '../lib/marketplace-logic';
+import { resolveMapPinPresentation, type MapMarkerRole, type MapPinPresentation } from '../lib/map-markers';
+import type { Lang } from '../types/marketplace';
+
+function LabeledMapPin({
+  pin,
+  testId,
+}: {
+  pin: MapPinPresentation;
+  testId: string;
+}) {
+  return (
+    <div
+      data-testid={testId}
+      data-pin-role={pin.role}
+      className="flex flex-col items-center select-none"
+    >
+      <span
+        className={`px-2 py-0.5 rounded ${pin.badgeClass} text-[10px] font-bold shadow-md whitespace-nowrap mb-0.5`}
+      >
+        {pin.label}
+      </span>
+      <svg
+        width="28"
+        height="36"
+        viewBox="0 0 28 36"
+        fill="none"
+        aria-hidden="true"
+        className="drop-shadow-md"
+      >
+        <path
+          d="M14 1C6.82 1 1 6.82 1 14c0 9.4 13 20.5 13 20.5S27 23.4 27 14C27 6.82 21.18 1 14 1Z"
+          fill={pin.background}
+          stroke={pin.borderColor}
+          strokeWidth="2"
+        />
+        <circle cx="14" cy="14" r="4.5" fill={pin.glyphColor} />
+      </svg>
+    </div>
+  );
+}
+
+export interface ExtraRiderMapPin {
+  id: number;
+  label: string;
+  lat: number;
+  lng: number;
+  isAvailable: boolean;
+  selected?: boolean;
+}
+
+interface DhakaMapPickerProps {
+  mapsApiKey: string;
+  lang: Lang;
+  center: { lat: number; lng: number };
+  markerLabel?: string;
+  markerRole?: MapMarkerRole;
+  userName?: string;
+  secondaryPoint?: { lat: number; lng: number; label: string; role?: MapMarkerRole };
+  riderPoint?: { lat: number; lng: number; label: string };
+  riderTarget?: { lat: number; lng: number };
+  extraRiders?: ExtraRiderMapPin[];
+  onSelectRiderPin?: (riderId: number) => void;
+  interactive?: boolean;
+  heightClass?: string;
+  onSelectLocation?: (coords: {
+    lat: number;
+    lng: number;
+    areaName?: string;
+    displayName?: string;
+  }) => void;
+}
+
+interface MapPolylineLike {
+  setMap: (map: unknown) => void;
+  setOptions: (opts: Record<string, unknown>) => void;
+}
+
+const MAJOR_BD_CITY_NAMES = new Set([
+  'Dhaka',
+  'Gulshan 2',
+  'Chattogram',
+  'Sylhet',
+  'Rajshahi',
+  'Khulna',
+  'Barishal',
+  'Rangpur',
+  'Mymensingh',
+  "Cox's Bazar",
+]);
+
+function isPointInsideDhakaMetro(lat: number, lng: number): boolean {
+  return lat >= 23.66 && lat <= 23.92 && lng >= 90.28 && lng <= 90.52;
+}
+
+function RouteOverlay({
+  origin,
+  destination,
+  skipFitBounds = false,
+}: {
+  origin: { lat: number; lng: number };
+  destination: { lat: number; lng: number };
+  skipFitBounds?: boolean;
+}) {
+  const map = useMap();
+  const routesLib = useMapsLibrary('routes');
+  const polylinesRef = useRef<MapPolylineLike[]>([]);
+  const originLat = origin.lat;
+  const originLng = origin.lng;
+  const destLat = destination.lat;
+  const destLng = destination.lng;
+
+  useEffect(() => {
+    if (!map || !routesLib) return;
+    polylinesRef.current.forEach((p) => p.setMap(null));
+    polylinesRef.current = [];
+
+    const request = {
+      origin: { lat: originLat, lng: originLng },
+      destination: { lat: destLat, lng: destLng },
+      travelMode: 'DRIVING',
+      fields: ['path', 'viewport'],
+    };
+
+    const RouteCls = (
+      routesLib as unknown as {
+        Route?: { computeRoutes: (req: unknown) => Promise<{ routes: any[] }> };
+      }
+    ).Route;
+    if (!RouteCls || typeof RouteCls.computeRoutes !== 'function') return;
+
+    RouteCls.computeRoutes(request)
+      .then(({ routes }) => {
+        if (!routes || routes.length === 0) return;
+        const primary = routes[0];
+        if (typeof primary.createPolylines === 'function') {
+          const lines = primary.createPolylines() as MapPolylineLike[];
+          lines.forEach((p) => {
+            p.setOptions({ strokeColor: '#E21B70', strokeWeight: 5 });
+            p.setMap(map);
+          });
+          polylinesRef.current = lines;
+        }
+        if (primary.viewport && !skipFitBounds) {
+          map.fitBounds(primary.viewport);
+        }
+      })
+      .catch(() => {
+        // Fallback silently if routes API quota/network unavailable
+      });
+
+    return () => {
+      polylinesRef.current.forEach((p) => p.setMap(null));
+      polylinesRef.current = [];
+    };
+  }, [map, routesLib, originLat, originLng, destLat, destLng, skipFitBounds]);
+
+  return null;
+}
+
+function TrackingBoundsAndRiderVector({
+  center,
+  secondaryPoint,
+  riderPoint,
+  riderTarget,
+}: {
+  center: { lat: number; lng: number };
+  secondaryPoint?: { lat: number; lng: number };
+  riderPoint?: { lat: number; lng: number };
+  riderTarget?: { lat: number; lng: number };
+}) {
+  const map = useMap();
+  const coreLib = useMapsLibrary('core');
+  const mapsLib = useMapsLibrary('maps');
+  const riderLineRef = useRef<MapPolylineLike | null>(null);
+  const fittedKeyRef = useRef<string>('');
+
+  const cLat = center.lat;
+  const cLng = center.lng;
+  const sLat = secondaryPoint?.lat;
+  const sLng = secondaryPoint?.lng;
+  const rLat = riderPoint?.lat;
+  const rLng = riderPoint?.lng;
+  const tLat = riderTarget?.lat ?? cLat;
+  const tLng = riderTarget?.lng ?? cLng;
+
+  useEffect(() => {
+    if (!map || !mapsLib || typeof rLat !== 'number' || typeof rLng !== 'number') {
+      if (riderLineRef.current) {
+        riderLineRef.current.setMap(null);
+        riderLineRef.current = null;
+      }
+      return;
+    }
+
+    const PolylineCtor = (
+      mapsLib as unknown as {
+        Polyline?: new (opts: Record<string, unknown>) => MapPolylineLike;
+      }
+    ).Polyline;
+    if (!PolylineCtor) return;
+
+    const path = [
+      { lat: rLat, lng: rLng },
+      { lat: tLat, lng: tLng },
+    ];
+
+    if (!riderLineRef.current) {
+      riderLineRef.current = new PolylineCtor({
+        path,
+        geodesic: true,
+        strokeColor: '#059669',
+        strokeOpacity: 0.85,
+        strokeWeight: 3.5,
+        map,
+      });
+    } else {
+      riderLineRef.current.setOptions({ path, map });
+    }
+
+    return () => {
+      if (riderLineRef.current) {
+        riderLineRef.current.setMap(null);
+        riderLineRef.current = null;
+      }
+    };
+  }, [map, mapsLib, rLat, rLng, tLat, tLng]);
+
+  useEffect(() => {
+    if (!map || !coreLib || typeof rLat !== 'number' || typeof rLng !== 'number') return;
+
+    const LatLngBoundsCtor = (
+      coreLib as unknown as {
+        LatLngBounds?: new () => {
+          extend: (pt: { lat: number; lng: number }) => void;
+        };
+      }
+    ).LatLngBounds;
+    if (!LatLngBoundsCtor) return;
+
+    const endpointKey = `${cLat.toFixed(4)},${cLng.toFixed(4)}|${sLat?.toFixed(4) ?? ''},${sLng?.toFixed(4) ?? ''}|hasRider`;
+    const currentBounds = map.getBounds();
+    const riderOutsideView =
+      currentBounds && typeof currentBounds.contains === 'function'
+        ? !currentBounds.contains({ lat: rLat, lng: rLng })
+        : false;
+
+    if (fittedKeyRef.current !== endpointKey || riderOutsideView) {
+      const bounds = new LatLngBoundsCtor();
+      bounds.extend({ lat: cLat, lng: cLng });
+      bounds.extend({ lat: rLat, lng: rLng });
+      if (typeof sLat === 'number' && typeof sLng === 'number') {
+        bounds.extend({ lat: sLat, lng: sLng });
+      }
+      (map as unknown as { fitBounds: (b: unknown, padding?: number) => void }).fitBounds(
+        bounds,
+        48
+      );
+      fittedKeyRef.current = endpointKey;
+    }
+  }, [map, coreLib, cLat, cLng, sLat, sLng, rLat, rLng]);
+
+  return null;
+}
+
+function MapCenterSync({
+  center,
+  skipPanRef,
+}: {
+  center: { lat: number; lng: number };
+  skipPanRef: React.MutableRefObject<{ lat: number; lng: number } | null>;
+}) {
+  const map = useMap();
+  const prevRef = useRef<{ lat: number; lng: number } | null>(null);
+
+  useEffect(() => {
+    if (!map) return;
+    if (
+      skipPanRef.current &&
+      Math.abs(skipPanRef.current.lat - center.lat) < 1e-6 &&
+      Math.abs(skipPanRef.current.lng - center.lng) < 1e-6
+    ) {
+      skipPanRef.current = null;
+      prevRef.current = { lat: center.lat, lng: center.lng };
+      return;
+    }
+    if (
+      prevRef.current &&
+      prevRef.current.lat === center.lat &&
+      prevRef.current.lng === center.lng
+    ) {
+      return;
+    }
+    prevRef.current = { lat: center.lat, lng: center.lng };
+    map.panTo(center);
+  }, [map, center.lat, center.lng, skipPanRef]);
+
+  return null;
+}
+
+function GoogleMapInner({
+  lang,
+  center,
+  markerLabel,
+  markerRole = 'user',
+  userName,
+  secondaryPoint,
+  riderPoint,
+  riderTarget,
+  extraRiders,
+  onSelectRiderPin,
+  interactive,
+  heightClass,
+  onSelectLocation,
+}: Omit<DhakaMapPickerProps, 'mapsApiKey'>) {
+  const status = useApiLoadingStatus();
+  const skipPanRef = useRef<{ lat: number; lng: number } | null>(null);
+  const reverseSeqRef = useRef(0);
+  const [resolving, setResolving] = useState(false);
+
+  const primaryPin = resolveMapPinPresentation({
+    role: markerRole,
+    label: markerLabel,
+    userName,
+    lang,
+  });
+  const secondaryPin = secondaryPoint
+    ? resolveMapPinPresentation({
+        role: secondaryPoint.role ?? 'vendor',
+        label: secondaryPoint.label,
+        userName,
+        lang,
+      })
+    : null;
+
+  const emitLocation = (lat: number, lng: number, shouldSkipPan = true) => {
+    if (!onSelectLocation || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
+    if (shouldSkipPan) {
+      skipPanRef.current = { lat, lng };
+    }
+    const nearest = resolveNearestAreaFromList(lat, lng, BANGLADESH_AREAS);
+    const immediateName =
+      nearest.area && nearest.distanceKm <= 6
+        ? nearest.area.name
+        : `Pinned (${lat.toFixed(4)}, ${lng.toFixed(4)})`;
+    const immediateDisplayName =
+      nearest.area && nearest.distanceKm <= 6
+        ? `${nearest.area.name}, Bangladesh`
+        : `Pinned (${lat.toFixed(4)}, ${lng.toFixed(4)}), Bangladesh`;
+
+    onSelectLocation({
+      lat,
+      lng,
+      areaName: immediateName,
+      displayName: immediateDisplayName,
+    });
+
+    const seq = ++reverseSeqRef.current;
+    setResolving(true);
+
+    const resolveViaBackend = () =>
+      apiFetch<{ displayName: string; areaName: string }>(
+        `/api/free/reverse-geocode?lat=${lat}&lng=${lng}&lang=${lang}`
+      )
+        .then((res) => {
+          if (seq !== reverseSeqRef.current) return;
+          const cleanArea = matchCanonicalAreaFromHints(
+            [res.areaName, res.displayName],
+            lat,
+            lng,
+            BANGLADESH_AREAS
+          );
+          skipPanRef.current = { lat, lng };
+          onSelectLocation({
+            lat,
+            lng,
+            areaName: cleanArea || immediateName,
+            displayName: res.displayName || immediateDisplayName,
+          });
+        })
+        .catch(() => {
+          // Keep immediate canonical nearest area/label if reverse geocode is unavailable
+        })
+        .finally(() => {
+          if (seq === reverseSeqRef.current) {
+            setResolving(false);
+          }
+        });
+
+    void resolveViaBackend();
+  };
+
+  if (status === APILoadingStatus.FAILED || status === APILoadingStatus.AUTH_FAILURE) {
+    return (
+      <FallbackDhakaMap
+        lang={lang}
+        center={center}
+        markerLabel={markerLabel}
+        markerRole={markerRole}
+        userName={userName}
+        secondaryPoint={secondaryPoint}
+        riderPoint={riderPoint}
+        extraRiders={extraRiders}
+        onSelectRiderPin={onSelectRiderPin}
+        interactive={interactive}
+        heightClass={heightClass}
+        onSelectLocation={onSelectLocation}
+      />
+    );
+  }
+
+  const showBangladeshZoom = Boolean(
+    (extraRiders && extraRiders.length > 0) || !isPointInsideDhakaMetro(center.lat, center.lng)
+  );
+
+  return (
+    <div
+      className={`relative w-full overflow-hidden rounded-xl border border-neutral-200 ${heightClass || 'h-[260px]'}`}
+    >
+      <GoogleMap
+        defaultCenter={center}
+        defaultZoom={showBangladeshZoom ? 7 : 14}
+        mapId="DEMO_MAP_ID"
+        gestureHandling="greedy"
+        clickableIcons={false}
+        disableDefaultUI={false}
+        internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
+        className="w-full h-full"
+        onClick={(ev) => {
+          if (!interactive || !ev.detail?.latLng) return;
+          const rawLatLng = ev.detail.latLng as unknown as {
+            lat: number | (() => number);
+            lng: number | (() => number);
+          };
+          const lat = typeof rawLatLng.lat === 'function' ? rawLatLng.lat() : rawLatLng.lat;
+          const lng = typeof rawLatLng.lng === 'function' ? rawLatLng.lng() : rawLatLng.lng;
+          emitLocation(lat, lng);
+        }}
+      >
+        <MapCenterSync center={center} skipPanRef={skipPanRef} />
+        <AdvancedMarker
+          position={center}
+          zIndex={30}
+          title={primaryPin.label}
+          draggable={Boolean(interactive)}
+          onDragEnd={(ev) => {
+            if (interactive && ev.latLng) {
+              emitLocation(ev.latLng.lat(), ev.latLng.lng());
+            }
+          }}
+        >
+          <LabeledMapPin pin={primaryPin} testId="gmp-primary-pin" />
+        </AdvancedMarker>
+        {secondaryPoint && secondaryPin && (
+          <AdvancedMarker
+            position={{ lat: secondaryPoint.lat, lng: secondaryPoint.lng }}
+            zIndex={25}
+            title={secondaryPin.label}
+          >
+            <LabeledMapPin pin={secondaryPin} testId="gmp-secondary-pin" />
+          </AdvancedMarker>
+        )}
+        {riderPoint && (
+          <AdvancedMarker
+            position={{ lat: riderPoint.lat, lng: riderPoint.lng }}
+            title={riderPoint.label}
+          >
+            <div className="relative flex items-center gap-1 px-2.5 py-1 rounded-full bg-emerald-600 text-white text-[11px] font-bold shadow-lg border-2 border-white">
+              <span className="w-2 h-2 rounded-full bg-emerald-200 animate-ping absolute -top-0.5 -right-0.5" />
+              <Bike className="w-3.5 h-3.5 shrink-0" />
+              <span>{riderPoint.label}</span>
+            </div>
+          </AdvancedMarker>
+        )}
+        {extraRiders?.map((er) => (
+          <AdvancedMarker
+            key={er.id}
+            position={{ lat: er.lat, lng: er.lng }}
+            title={er.label}
+            onClick={() => onSelectRiderPin?.(er.id)}
+          >
+            <div
+              className={`flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold shadow-md border-2 ${
+                er.selected
+                  ? 'bg-[#E21B70] text-white border-white scale-110'
+                  : er.isAvailable
+                  ? 'bg-emerald-600 text-white border-white'
+                  : 'bg-neutral-600 text-white border-white'
+              }`}
+            >
+              <Bike className="w-3 h-3 shrink-0" />
+              <span>{er.label}</span>
+            </div>
+          </AdvancedMarker>
+        ))}
+        {secondaryPoint && (
+          <RouteOverlay
+            origin={{ lat: secondaryPoint.lat, lng: secondaryPoint.lng }}
+            destination={center}
+            skipFitBounds={Boolean(riderPoint)}
+          />
+        )}
+        <TrackingBoundsAndRiderVector
+          center={center}
+          secondaryPoint={secondaryPoint}
+          riderPoint={riderPoint}
+          riderTarget={riderTarget}
+        />
+      </GoogleMap>
+      {interactive && (
+        <div className="absolute bottom-7 left-2.5 right-14 flex items-center justify-between gap-2 bg-white/95 backdrop-blur-xs border border-neutral-200 rounded-lg px-2.5 py-1.5 text-[11px] font-medium text-neutral-700 shadow-xs">
+          <span className="truncate">
+            {resolving
+              ? lang === 'bn'
+                ? 'ঠিকানা নির্ধারণ হচ্ছে...'
+                : 'Setting pinned location...'
+              : primaryPin.label
+              ? `${primaryPin.label} · `
+              : lang === 'bn'
+              ? 'ম্যাপে ক্লিক বা পিন টানুন · '
+              : 'Click map or drag pin · '}
+            <span className="font-mono-nums text-neutral-500">
+              {center.lat.toFixed(4)}, {center.lng.toFixed(4)}
+            </span>
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              if (navigator.geolocation) {
+                navigator.geolocation.getCurrentPosition(
+                  (pos) => emitLocation(pos.coords.latitude, pos.coords.longitude, false),
+                  () => emitLocation(23.7949, 90.4144, false)
+                );
+              }
+            }}
+            className="inline-flex items-center gap-1 text-[#E21B70] font-bold hover:underline whitespace-nowrap shrink-0"
+          >
+            <LocateFixed className="w-3.5 h-3.5" />
+            <span>GPS</span>
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FallbackDhakaMap({
+  lang,
+  center,
+  markerLabel,
+  markerRole = 'user',
+  userName,
+  secondaryPoint,
+  riderPoint,
+  extraRiders,
+  onSelectRiderPin,
+  interactive,
+  heightClass,
+  onSelectLocation,
+}: Omit<DhakaMapPickerProps, 'mapsApiKey'>) {
+  const reverseSeqRef = useRef(0);
+  const primaryPin = resolveMapPinPresentation({
+    role: markerRole,
+    label: markerLabel,
+    userName,
+    lang,
+  });
+  const secondaryPin = secondaryPoint
+    ? resolveMapPinPresentation({
+        role: secondaryPoint.role ?? 'vendor',
+        label: secondaryPoint.label,
+        userName,
+        lang,
+      })
+    : null;
+  const distance = secondaryPoint
+    ? haversineDistanceKm(center.lat, center.lng, secondaryPoint.lat, secondaryPoint.lng)
+    : null;
+
+  const allPoints: Array<{ lat: number; lng: number }> = [
+    center,
+    ...(secondaryPoint ? [secondaryPoint] : []),
+    ...(riderPoint ? [riderPoint] : []),
+    ...(extraRiders || []),
+  ];
+  const allInsideDhaka = allPoints.every((pt) => isPointInsideDhakaMetro(pt.lat, pt.lng));
+
+  // Fit multi-point route maps cleanly around visible pins; otherwise show Dhaka Metro or All-Bangladesh bounds
+  const shouldFitMultiPointBounds = !interactive && allPoints.length > 1;
+  const bounds = (() => {
+    if (shouldFitMultiPointBounds) {
+      const lats = allPoints.map((pt) => pt.lat);
+      const lngs = allPoints.map((pt) => pt.lng);
+      const rawMinLat = Math.min(...lats);
+      const rawMaxLat = Math.max(...lats);
+      const rawMinLng = Math.min(...lngs);
+      const rawMaxLng = Math.max(...lngs);
+      const latSpan = Math.max(0.005, rawMaxLat - rawMinLat);
+      const lngSpan = Math.max(0.006, rawMaxLng - rawMinLng);
+      return {
+        minLat: rawMinLat - latSpan * 0.45,
+        maxLat: rawMaxLat + latSpan * 0.65,
+        minLng: rawMinLng - lngSpan * 0.55,
+        maxLng: rawMaxLng + lngSpan * 0.55,
+      };
+    }
+    return allInsideDhaka
+      ? { minLat: 23.71, maxLat: 23.89, minLng: 90.34, maxLng: 90.47 }
+      : { minLat: 20.6, maxLat: 26.5, minLng: 88.1, maxLng: 92.6 };
+  })();
+
+  const toXY = (lat: number, lng: number) => {
+    const x = Math.min(93, Math.max(7, ((lng - bounds.minLng) / (bounds.maxLng - bounds.minLng)) * 100));
+    const y = Math.min(89, Math.max(10, (1 - (lat - bounds.minLat) / (bounds.maxLat - bounds.minLat)) * 100));
+    return { x, y };
+  };
+
+  const emitFallbackPoint = (lat: number, lng: number, preferredAreaName?: string) => {
+    if (!onSelectLocation) return;
+    const nearest = resolveNearestAreaFromList(lat, lng, BANGLADESH_AREAS);
+    const immediateName =
+      preferredAreaName ||
+      (nearest.area && nearest.distanceKm <= 6
+        ? nearest.area.name
+        : `Pinned (${lat.toFixed(4)}, ${lng.toFixed(4)})`);
+    const immediateDisplayName =
+      preferredAreaName
+        ? `${preferredAreaName}, Bangladesh`
+        : nearest.area && nearest.distanceKm <= 6
+        ? `${nearest.area.name}, Bangladesh`
+        : `Pinned (${lat.toFixed(4)}, ${lng.toFixed(4)}), Bangladesh`;
+    onSelectLocation({
+      lat,
+      lng,
+      areaName: immediateName,
+      displayName: immediateDisplayName,
+    });
+    const seq = ++reverseSeqRef.current;
+    apiFetch<{ displayName: string; areaName: string }>(
+      `/api/free/reverse-geocode?lat=${lat}&lng=${lng}&lang=${lang}`
+    )
+      .then((res) => {
+        if (seq !== reverseSeqRef.current) return;
+        const cleanArea =
+          preferredAreaName ||
+          matchCanonicalAreaFromHints([res.areaName, res.displayName], lat, lng, BANGLADESH_AREAS) ||
+          immediateName;
+        onSelectLocation({
+          lat,
+          lng,
+          areaName: cleanArea,
+          displayName: res.displayName || immediateDisplayName,
+        });
+      })
+      .catch(() => {});
+  };
+
+  const fromClientPoint = (ev: React.MouseEvent<HTMLDivElement>) => {
+    if (!interactive || !onSelectLocation) return;
+    const rect = ev.currentTarget.getBoundingClientRect();
+    const pctX = ((ev.clientX - rect.left) / Math.max(1, rect.width)) * 100;
+    const pctY = ((ev.clientY - rect.top) / Math.max(1, rect.height)) * 100;
+    const lng = bounds.minLng + (pctX / 100) * (bounds.maxLng - bounds.minLng);
+    const lat = bounds.minLat + (1 - pctY / 100) * (bounds.maxLat - bounds.minLat);
+    emitFallbackPoint(lat, lng);
+  };
+
+  const p1 = toXY(center.lat, center.lng);
+  const p2 = secondaryPoint ? toXY(secondaryPoint.lat, secondaryPoint.lng) : null;
+  const pRider = riderPoint ? toXY(riderPoint.lat, riderPoint.lng) : null;
+
+  const pinButtons = allInsideDhaka
+    ? DHAKA_AREAS
+    : BANGLADESH_AREAS.filter((a) => MAJOR_BD_CITY_NAMES.has(a.name));
+
+  return (
+    <div
+      onClick={fromClientPoint}
+      className={`relative w-full overflow-hidden rounded-xl border border-neutral-200 bg-[#F8FAFC] ${interactive ? 'cursor-crosshair' : ''} ${heightClass || 'h-[260px]'}`}
+    >
+      {/* Map Grid */}
+      <svg
+        className="absolute inset-0 w-full h-full pointer-events-none"
+        viewBox="0 0 100 100"
+        preserveAspectRatio="none"
+      >
+        <defs>
+          <pattern id="bdGrid" width="12.5" height="12.5" patternUnits="userSpaceOnUse">
+            <path d="M 12.5 0 L 0 0 0 12.5" fill="none" stroke="#E2E8F0" strokeWidth="0.4" />
+          </pattern>
+        </defs>
+        <rect width="100" height="100" fill="url(#bdGrid)" />
+        <path
+          d={allInsideDhaka ? 'M 55 48 Q 62 52 68 46 Q 74 42 78 50' : 'M 42 15 Q 50 45 48 75 Q 52 86 68 92'}
+          fill="none"
+          stroke="#CBD5E1"
+          strokeWidth="2.2"
+          strokeLinecap="round"
+        />
+        {p2 && (
+          <line
+            x1={p2.x}
+            y1={p2.y}
+            x2={p1.x}
+            y2={p1.y}
+            stroke="#E21B70"
+            strokeWidth="1.2"
+            strokeDasharray="2.5 1.5"
+          />
+        )}
+        {pRider && (
+          <line
+            x1={pRider.x}
+            y1={pRider.y}
+            x2={p1.x}
+            y2={p1.y}
+            stroke="#059669"
+            strokeWidth="1.4"
+            strokeDasharray="1.8 1.2"
+          />
+        )}
+      </svg>
+
+      {/* Mode Badge */}
+      <span className="pointer-events-none absolute top-2 left-2 z-10 px-2 py-0.5 rounded bg-white/90 border border-neutral-200 text-[10px] font-bold text-neutral-600">
+        {allInsideDhaka ? 'Dhaka Metro View' : 'Bangladesh Map View'}
+      </span>
+
+      {/* Clickable Quick Area / City Pins */}
+      {interactive &&
+        pinButtons.map((area) => {
+          const pos = toXY(area.lat, area.lng);
+          const tol = allInsideDhaka ? 0.008 : 0.08;
+          const isClose =
+            Math.abs(area.lat - center.lat) < tol && Math.abs(area.lng - center.lng) < tol;
+          return (
+            <button
+              key={area.name}
+              type="button"
+              onClick={(ev) => {
+                ev.stopPropagation();
+                emitFallbackPoint(area.lat, area.lng, area.name);
+              }}
+              style={{ left: `${pos.x}%`, top: `${pos.y}%` }}
+              className={`absolute -translate-x-1/2 -translate-y-1/2 px-2 py-0.5 rounded-md text-[10px] font-semibold transition-colors ${
+                isClose
+                  ? 'bg-[#E21B70] text-white shadow-sm z-20'
+                  : 'bg-white/95 text-[#2E3138] border border-neutral-200 hover:border-[#E21B70] z-10'
+              }`}
+            >
+              {area.name}
+            </button>
+          );
+        })}
+
+      {/* Primary Pin (Vendor - Black / User - Red) */}
+      <div
+        data-testid="map-primary-pin"
+        data-pin-role={primaryPin.role}
+        style={{ left: `${p1.x}%`, top: `${p1.y}%` }}
+        className="absolute -translate-x-1/2 -translate-y-full z-20 flex flex-col items-center pointer-events-none"
+      >
+        <span
+          className={`px-2 py-0.5 rounded ${primaryPin.badgeClass} text-[10px] font-bold shadow-sm whitespace-nowrap mb-0.5`}
+        >
+          {primaryPin.label}
+        </span>
+        <MapPin className={`w-5 h-5 ${primaryPin.pinIconClass}`} />
+      </div>
+
+      {/* Restaurant / Origin Pin (Black) */}
+      {p2 && secondaryPoint && secondaryPin && (
+        <div
+          data-testid="map-secondary-pin"
+          data-pin-role={secondaryPin.role}
+          style={{ left: `${p2.x}%`, top: `${p2.y}%` }}
+          className="absolute -translate-x-1/2 -translate-y-full z-20 flex flex-col items-center pointer-events-none"
+        >
+          <span
+            className={`px-2 py-0.5 rounded ${secondaryPin.badgeClass} text-[10px] font-bold shadow-sm whitespace-nowrap mb-0.5`}
+          >
+            {secondaryPin.label}
+          </span>
+          <MapPin className={`w-5 h-5 ${secondaryPin.pinIconClass}`} />
+        </div>
+      )}
+
+      {/* Single Rider Live Marker */}
+      {pRider && riderPoint && (
+        <div
+          style={{ left: `${pRider.x}%`, top: `${pRider.y}%` }}
+          className="absolute -translate-x-1/2 -translate-y-1/2 z-30 flex items-center gap-1 px-2.5 py-1 rounded-full bg-emerald-600 text-white text-[10px] font-bold shadow-md border border-white"
+        >
+          <span className="w-2 h-2 rounded-full bg-emerald-200 animate-pulse" />
+          <Bike className="w-3 h-3 shrink-0" />
+          <span className="whitespace-nowrap">{riderPoint.label}</span>
+        </div>
+      )}
+
+      {/* Multi-Rider Fleet Pins (Admin Fleet Control) */}
+      {extraRiders?.map((er) => {
+        const pos = toXY(er.lat, er.lng);
+        return (
+          <button
+            key={er.id}
+            type="button"
+            onClick={(ev) => {
+              ev.stopPropagation();
+              onSelectRiderPin?.(er.id);
+            }}
+            style={{ left: `${pos.x}%`, top: `${pos.y}%` }}
+            className={`absolute -translate-x-1/2 -translate-y-1/2 flex items-center gap-1 px-2 py-1 rounded-full text-[10px] font-bold shadow-md border transition-transform ${
+              er.selected
+                ? 'bg-[#E21B70] text-white border-white z-40 scale-110'
+                : er.isAvailable
+                ? 'bg-emerald-600 text-white border-white z-30 hover:scale-105'
+                : 'bg-neutral-600 text-white border-white z-20 hover:scale-105'
+            }`}
+          >
+            <Bike className="w-3 h-3 shrink-0" />
+            <span className="whitespace-nowrap">{er.label}</span>
+          </button>
+        );
+      })}
+
+      <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between gap-2 bg-white/95 border border-neutral-200 rounded-lg px-3 py-1.5 text-xs text-neutral-600">
+        <span className="font-mono-nums truncate">
+          {center.lat.toFixed(4)}, {center.lng.toFixed(4)}
+          {distance !== null ? ` · ${distance.toFixed(1)} km` : ''}
+          {riderPoint ? ` · Rider ${riderPoint.lat.toFixed(4)}, ${riderPoint.lng.toFixed(4)}` : ''}
+        </span>
+        {interactive && (
+          <button
+            type="button"
+            onClick={(ev) => {
+              ev.stopPropagation();
+              if (navigator.geolocation) {
+                navigator.geolocation.getCurrentPosition(
+                  (pos) => emitFallbackPoint(pos.coords.latitude, pos.coords.longitude),
+                  () => emitFallbackPoint(23.7949, 90.4144, 'Gulshan 2')
+                );
+              } else {
+                emitFallbackPoint(23.7949, 90.4144, 'Gulshan 2');
+              }
+            }}
+            className="inline-flex items-center gap-1 text-[#E21B70] font-semibold hover:underline whitespace-nowrap shrink-0"
+          >
+            <LocateFixed className="w-3.5 h-3.5" />
+            <span>GPS</span>
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export function DhakaMapPicker(props: DhakaMapPickerProps) {
+  const [useFallback] = useState(false);
+  const effectiveApiKey =
+    props.mapsApiKey || (import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined) || '';
+
+  if (!effectiveApiKey || useFallback) {
+    return (
+      <FallbackDhakaMap
+        lang={props.lang}
+        center={props.center}
+        markerLabel={props.markerLabel}
+        markerRole={props.markerRole}
+        userName={props.userName}
+        secondaryPoint={props.secondaryPoint}
+        riderPoint={props.riderPoint}
+        extraRiders={props.extraRiders}
+        onSelectRiderPin={props.onSelectRiderPin}
+        interactive={props.interactive}
+        heightClass={props.heightClass}
+        onSelectLocation={props.onSelectLocation}
+      />
+    );
+  }
+
+  return (
+    <APIProvider apiKey={effectiveApiKey} language={props.lang} region="BD">
+      <GoogleMapInner
+        lang={props.lang}
+        center={props.center}
+        markerLabel={props.markerLabel}
+        markerRole={props.markerRole}
+        userName={props.userName}
+        secondaryPoint={props.secondaryPoint}
+        riderPoint={props.riderPoint}
+        riderTarget={props.riderTarget}
+        extraRiders={props.extraRiders}
+        onSelectRiderPin={props.onSelectRiderPin}
+        interactive={props.interactive}
+        heightClass={props.heightClass}
+        onSelectLocation={props.onSelectLocation}
+      />
+    </APIProvider>
+  );
+}

@@ -1,0 +1,247 @@
+import crypto from 'node:crypto';
+import { NextFunction, Request, Response } from 'express';
+import { eq, sql } from 'drizzle-orm';
+import { verifySupabaseAccessToken } from '../lib/supabase-admin.ts';
+import { db, hasDatabaseConfig } from '../db/index.ts';
+import { users } from '../db/schema.ts';
+import { isProtectedSuperAdminEmail } from '../lib/marketplace-logic.ts';
+
+export type UserRole = 'customer' | 'restaurant_owner' | 'rider' | 'admin' | 'super_admin';
+
+export interface AuthenticatedUser {
+  uid: string;
+  email: string;
+  fullName: string;
+  role: UserRole;
+  isSandbox: boolean;
+}
+
+export interface AuthRequest extends Request {
+  user?: AuthenticatedUser;
+}
+
+const SANDBOX_SECRET =
+  process.env.SANDBOX_SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+
+export function signSandboxToken(payload: {
+  uid: string;
+  email: string;
+  fullName: string;
+  role: UserRole;
+  isSandbox?: boolean;
+}): string {
+  const isSandbox = payload.isSandbox ?? true;
+  const data = Buffer.from(
+    JSON.stringify({
+      ...payload,
+      isSandbox,
+      exp: Date.now() + 1000 * 60 * 60 * 24 * 7,
+    })
+  ).toString('base64url');
+  const sig = crypto.createHmac('sha256', SANDBOX_SECRET).update(data).digest('base64url');
+  return `${isSandbox ? 'sbx' : 'fbd'}.${data}.${sig}`;
+}
+
+export function verifySandboxToken(token: string): AuthenticatedUser | null {
+  if (!token.startsWith('sbx.') && !token.startsWith('fbd.')) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [, data, sig] = parts;
+  const expectedSig = crypto.createHmac('sha256', SANDBOX_SECRET).update(data).digest('base64url');
+  const sigBuf = Buffer.from(sig);
+  const expectedBuf = Buffer.from(expectedSig);
+  if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(Buffer.from(data, 'base64url').toString('utf8'));
+    if (!parsed.exp || parsed.exp < Date.now()) return null;
+    const isSandbox = token.startsWith('sbx.') && Boolean(parsed.isSandbox ?? true);
+    return {
+      uid: parsed.uid,
+      email: parsed.email,
+      fullName: parsed.fullName,
+      role: parsed.role,
+      isSandbox,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function getOrCreateUser(
+  uid: string,
+  email: string,
+  fullName?: string,
+  defaultRole: UserRole = 'customer'
+) {
+  const emailLower = email.trim().toLowerCase();
+  const isPrimaryAdmin = isProtectedSuperAdminEmail(emailLower);
+  if (!hasDatabaseConfig()) {
+    const now = new Date();
+    return {
+      id: 1,
+      uid,
+      email: emailLower,
+      fullName: fullName || emailLower.split('@')[0] || 'Foodora User',
+      phone: null,
+      avatarUrl: null,
+      role: isPrimaryAdmin ? 'super_admin' : defaultRole,
+      status: 'active',
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+  try {
+    const existing = await db.select().from(users).where(eq(users.uid, uid)).limit(1);
+    if (existing.length > 0) {
+      if (isPrimaryAdmin && existing[0].role !== 'super_admin') {
+        const promoted = await db
+          .update(users)
+          .set({ role: 'super_admin', updatedAt: new Date() })
+          .where(eq(users.id, existing[0].id))
+          .returning();
+        return promoted[0];
+      }
+      return existing[0];
+    }
+
+    // Check if this email already has an existing Foodora BD user record (e.g., from Email/Password or legacy login)
+    const existingByEmail = await db
+      .select()
+      .from(users)
+      .where(sql`lower(${users.email}) = ${emailLower}`)
+      .limit(1);
+    if (existingByEmail.length > 0) {
+      const current = existingByEmail[0];
+      const nextRole = isPrimaryAdmin ? 'super_admin' : current.role;
+      const nextName =
+        fullName && fullName.trim() && current.fullName.startsWith('Foodora')
+          ? fullName.trim()
+          : current.fullName;
+      if (nextRole !== current.role || nextName !== current.fullName) {
+        const updated = await db
+          .update(users)
+          .set({ role: nextRole, fullName: nextName, updatedAt: new Date() })
+          .where(eq(users.id, current.id))
+          .returning();
+        return updated[0];
+      }
+      return current;
+    }
+
+    const assignedRole: UserRole = isPrimaryAdmin ? 'super_admin' : defaultRole;
+    const inserted = await db
+      .insert(users)
+      .values({
+        uid,
+        email: emailLower,
+        fullName: fullName || emailLower.split('@')[0] || 'Foodora User',
+        role: assignedRole,
+      })
+      .onConflictDoUpdate({
+        target: users.uid,
+        set: {
+          email: emailLower,
+          updatedAt: new Date(),
+        },
+      })
+      .returning();
+    return inserted[0];
+  } catch (error) {
+    console.error('Database user upsert failed:', error);
+    throw new Error('Failed to synchronize user account.', { cause: error });
+  }
+}
+
+export async function resolveUserFromToken(tokenRaw?: string | null): Promise<AuthenticatedUser | null> {
+  const token = String(tokenRaw || '').trim();
+  if (!token) return null;
+
+  // 1. Check server-signed session (fbd.) or sandbox (sbx.) token
+  const sandboxUser = verifySandboxToken(token);
+  if (sandboxUser) {
+    if (!hasDatabaseConfig()) {
+      return sandboxUser;
+    }
+    const dbUser = await getOrCreateUser(
+      sandboxUser.uid,
+      sandboxUser.email,
+      sandboxUser.fullName,
+      sandboxUser.role
+    );
+    if (dbUser.status === 'suspended') {
+      return null;
+    }
+    return {
+      uid: dbUser.uid,
+      email: dbUser.email,
+      fullName: dbUser.fullName,
+      role: dbUser.role as UserRole,
+      isSandbox: sandboxUser.isSandbox,
+    };
+  }
+
+  // 2. Verify genuine Supabase Auth access token
+  const supaUser = await verifySupabaseAccessToken(token);
+  if (!supaUser) return null;
+  const dbUser = await getOrCreateUser(
+    supaUser.uid,
+    supaUser.email,
+    supaUser.fullName,
+    'customer'
+  );
+  if (dbUser.status === 'suspended') {
+    return null;
+  }
+  return {
+    uid: dbUser.uid,
+    email: dbUser.email,
+    fullName: dbUser.fullName,
+    role: dbUser.role as UserRole,
+    isSandbox: false,
+  };
+}
+
+async function resolveUserFromHeader(authHeader?: string): Promise<AuthenticatedUser | null> {
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+  return resolveUserFromToken(authHeader.slice('Bearer '.length));
+}
+
+export const optionalAuth = async (req: AuthRequest, _res: Response, next: NextFunction) => {
+  try {
+    const user = await resolveUserFromHeader(req.headers.authorization);
+    if (user) {
+      req.user = user;
+    }
+  } catch (err) {
+    console.warn('Optional auth token ignored:', err instanceof Error ? err.message : err);
+  }
+  next();
+};
+
+export const requireAuth = async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const user = await resolveUserFromHeader(req.headers.authorization);
+    if (!user) {
+      return res.status(401).json({ error: 'Unauthorized: Missing or invalid authentication token' });
+    }
+    req.user = user;
+    next();
+  } catch (error) {
+    console.error('Auth verification error:', error);
+    return res.status(401).json({ error: 'Unauthorized: Token verification failed' });
+  }
+};
+
+export const requireRole = (allowedRoles: UserRole[]) => {
+  return (req: AuthRequest, res: Response, next: NextFunction) => {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    if (!allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Forbidden: Insufficient role permissions' });
+    }
+    next();
+  };
+};
