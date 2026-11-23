@@ -1994,7 +1994,7 @@ export function collectMerchantOrderAlertRecipients(input: {
   for (const raw of candidates) {
     const clean = String(raw || '').trim().toLowerCase();
     if (!clean || !clean.includes('@') || !clean.includes('.')) continue;
-    if (clean.endsWith('@foodora.bd')) continue; // skip synthetic demo sandbox addresses
+    if (clean.endsWith('@foodora.bd') || clean.endsWith('.bd') || clean.endsWith('.example')) continue; // skip synthetic demo sandbox or mock .bd addresses
     if (seen.has(clean)) continue;
     seen.add(clean);
     out.push(clean);
@@ -2128,8 +2128,9 @@ export function detectOrderBatchChanges<T extends OrderSnapshotItem>(
   const nextMap = new Map<number, { status: string; paymentStatus?: string }>();
   const newOrders: T[] = [];
   const updatedOrders: T[] = [];
+  const list = Array.isArray(nextOrders) ? nextOrders : [];
 
-  for (const ord of nextOrders) {
+  for (const ord of list) {
     nextMap.set(ord.id, { status: ord.status, paymentStatus: ord.paymentStatus });
     if (!prevMap) continue;
     const prev = prevMap.get(ord.id);

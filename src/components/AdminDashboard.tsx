@@ -339,10 +339,10 @@ export function AdminDashboard({
         settings: PlatformSettings | null;
         adminPinEmails?: string[];
       }>('/api/admin/workspace');
-      setRestaurants(res.restaurants);
+      setRestaurants(res.restaurants || []);
       setProducts(res.products || []);
 
-      const changes = detectOrderBatchChanges(orderSnapshotMapRef.current, res.orders);
+      const changes = detectOrderBatchChanges(orderSnapshotMapRef.current, res.orders || []);
       orderSnapshotMapRef.current = changes.nextMap;
       if (silent && changes.newOrders.length > 0) {
         const newest = changes.newOrders[0];
@@ -366,12 +366,12 @@ export function AdminDashboard({
         );
       }
 
-      setOrders(res.orders);
-      setUsers(res.users);
-      setLedger(res.ledger);
-      setPayouts(res.payouts);
-      setCoupons(res.coupons);
-      setRiders(res.riders);
+      setOrders(res.orders || []);
+      setUsers(res.users || []);
+      setLedger(res.ledger || []);
+      setPayouts(res.payouts || []);
+      setCoupons(res.coupons || []);
+      setRiders(res.riders || []);
       setAuditLogs(res.auditLogs || []);
       setSettings(res.settings);
       if (Array.isArray(res.adminPinEmails) && res.adminPinEmails.length > 0) {
@@ -397,6 +397,7 @@ export function AdminDashboard({
       }
     } catch (err) {
       console.error('Failed to load admin workspace:', err);
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to load admin workspace');
     } finally {
       if (!silent) setLoading(false);
     }
@@ -757,14 +758,14 @@ export function AdminDashboard({
         }
       );
       setEmailSettings(res.settings);
-      setEmailNotifyEmail(res.settings.notifyEmail || PRIMARY_SUPER_ADMIN_EMAIL);
+      setEmailNotifyEmail(res.settings?.notifyEmail || PRIMARY_SUPER_ADMIN_EMAIL);
       setEmailSmtpPass('');
       setEmailResendKey('');
       setFeedback(
-        res.settings.configured
+        res.settings?.configured
           ? lang === 'bn'
             ? 'ইমেইল ইনভয়েস ডেলিভারি সেটিংস সংরক্ষণ হয়েছে।'
-            : `Email invoice transport saved (${res.settings.activeProvider.toUpperCase()} active).`
+            : `Email invoice transport saved (${res.settings?.activeProvider?.toUpperCase() || ''} active).`
           : 'Settings saved — enter your Gmail App Password or Resend API key to enable live inbox delivery.'
       );
       await loadBackendStatus();
